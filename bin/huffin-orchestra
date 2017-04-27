@@ -1,0 +1,320 @@
+#!/usr/bin/env node
+const argv = require('yargs')
+    .command('spawn', 'spawn boxes', {
+      tag: {
+        string: true,
+        demand: true
+      },
+      image: {
+        demand: true
+      },
+      count: {
+        number: true,
+        demand: true
+      },
+      keys: {
+        string: true,
+        demand: true
+      },
+      region: {
+        string: true,
+        default: 'nyc2'
+      },
+      size: {
+        string: true,
+        default: '512mb'
+      }
+    })
+    .command('destroy', 'destroy boxes', {
+      tag: {
+        string: true,
+        demand: true
+      }
+    })
+    .command('schedule', 'schedule a job on all boxes', {
+      tag: {
+        string: true,
+        demand: true
+      },
+      email: {
+        string: true
+      },
+      prefix: {
+        string: true,
+        demand: true
+      }
+    })
+    .command('status', 'check status of boxes', {
+      tag: {
+        string: true,
+        demand: true
+      },
+      prefix: {
+        string: true,
+        demand: true
+      }
+    })
+    .demandCommand()
+    .help()
+    .argv;
+
+const assert = require('assert');
+const async = require('async');
+const fs = require('fs');
+const request = require('request');
+const prompt = require('prompt');
+const huffin = require('huffin');
+const DigitalOcean = require('do-wrapper');
+
+const TOKEN = process.env.OCEAN_TOKEN;
+assert(TOKEN, 'Please set up OCEAN_TOKEN env variable');
+
+const USERNAME = process.env.HUFFIN_USERNAME;
+assert(USERNAME, 'Please set up HUFFIN_USERNAME env variable');
+
+const PASSPHRASE = process.env.HUFFIN_PASSPHRASE;
+assert(PASSPHRASE, 'Please set up HUFFIN_PASSPHRASE env variable');
+
+const CERT = process.env.HUFFIN_CERT;
+assert(CERT, 'Please set up HUFFIN_CERT env variable');
+
+const PORT = (process.env.HUFFIN_PORT | 0) || 1443;
+
+const TARGET_PROBABILITY = 0.95;
+
+const command = argv._[0];
+
+const ocean = new DigitalOcean(TOKEN);
+const cert = fs.readFileSync(CERT);
+
+prompt.start();
+
+if (command === 'spawn') {
+  function spawn(data) {
+    async.times(argv.count, (i, callback) => {
+      ocean.dropletsCreate({
+        name: 'huffin-' + argv.tag + '-' + i,
+        ssh_keys: data.keys,
+        region: argv.region,
+
+        size: argv.size,
+        image: data.image,
+
+        tags: [ 'huffin-' + argv.tag ]
+      }, (err, res, body) => callback(err, body));
+    }, (err, results) => {
+      if (err)
+        throw new Error(err.message);
+
+      console.log('Spawned %d droplets', results.length);
+    });
+  }
+
+  async.parallel({
+    keys: (callback) => {
+      ocean.accountGetKeys('*', (err, res, body) => {
+        if (err)
+          return callback(err);
+
+        const query = argv.keys.split(',');
+        const keys = body.ssh_keys.filter(({ name }) => query.includes(name));
+        callback(null, keys.map(({ id }) => id));
+      });
+    },
+    image: (callback) => {
+      ocean.imagesGetAll({
+        private: true
+      }, (err, res, body) => {
+        if (err)
+          return callback(err);
+
+        const images = body.images.filter(({ name }) => name === argv.image);
+        assert.equal(images.length, 1, `Image ${argv.image} not found`);
+
+        callback(null, images[0].id);
+      });
+    }
+  }, (err, data) => {
+    console.log('About to spawn %d droplets', argv.count);
+    prompt.get('Are you sure?', (err) => {
+      if (err)
+        throw err;
+
+      spawn(data);
+    });
+  });
+} else if (command === 'destroy') {
+  function destroy(ids) {
+    async.forEach(ids, (id, callback) => {
+      ocean.dropletsDelete(id, callback);
+    }, (err) => {
+      if (err)
+        throw new Error(err.message);
+
+      console.log('Deleted %d dropletes', ids.length);
+    })
+  }
+
+  ocean.dropletsGetAll({
+    tag_name: 'huffin-' + argv.tag,
+    per_page: 1000
+  }, (err, res, body) => {
+    if (err)
+      throw err.message;
+
+    const names = body.droplets.map(({ name }) => name);
+    console.log('Going to destroy: ');
+    console.log(names.join(', '));
+    prompt.get('Are you sure?', (err) => {
+      if (err)
+        throw err;
+
+      destroy(body.droplets.map(({ id }) => id));
+    });
+  });
+} else if (command === 'schedule') {
+  function addJob(ip, prefix, email, callback) {
+    request.post({
+      uri: `https://${ip}:${PORT}/job`,
+      servername: 'huffin.generator',
+      ca: [ cert ],
+      json: true,
+      auth: {
+        user: USERNAME,
+        password: PASSPHRASE
+      },
+      body: { prefix, email }
+    }, (err, res, body) => {
+      callback(err, body);
+    })
+  }
+
+  function schedule(droplets) {
+    async.map(droplets, (droplet, callback) => {
+      const ip = droplet.networks.v4[0].ip_address;
+
+      addJob(ip, argv.prefix, argv.email, callback);
+    }, (err, scheduled) => {
+      if (err)
+        throw err.message;
+
+      console.log('Scheduled %d jobs', scheduled.length);
+      console.log(scheduled);
+    });
+  }
+
+  ocean.dropletsGetAll({
+    tag_name: 'huffin-' + argv.tag,
+    per_page: 1000
+  }, (err, res, body) => {
+    if (err)
+      throw err.message;
+
+    const names = body.droplets.map(({ name }) => name);
+    console.log('Going to schedule "%s" on %d droplets: ', argv.prefix,
+                names.length);
+    console.log(names.join(', '));
+
+    prompt.get('Are you sure?', (err) => {
+      if (err)
+        throw err;
+
+      schedule(body.droplets);
+    });
+  });
+} else if (command === 'status') {
+  function pad2(num) {
+    let res = num.toString();
+    while (res.length < 2)
+      res = ' ' + res;
+    return res;
+  }
+
+  function getStatus(ip, prefix, callback) {
+    request.get({
+      uri: `https://${ip}:${PORT}/jobs`,
+      servername: 'huffin.generator',
+      ca: [ cert ],
+      json: true,
+      auth: {
+        user: USERNAME,
+        password: PASSPHRASE
+      }
+    }, (err, res, body) => {
+      if (err)
+        return callback(null, { jobs: [], history: [], queue: [] });
+      callback(err, body);
+    })
+  }
+
+  function status(droplets) {
+    async.map(droplets, (droplet, callback) => {
+      const ip = droplet.networks.v4[0].ip_address;
+
+      getStatus(ip, argv.prefix, callback);
+    }, (err, statuses) => {
+      if (err)
+        throw err.message;
+
+      let jobs = [];
+      statuses.forEach((status) => {
+        jobs = jobs.concat(status.jobs, status.history, status.queue);
+      });
+
+      jobs = jobs.filter(job => job.config.prefix === argv.prefix);
+
+      const status = new Map();
+      const results = [];
+
+      let total = 0;
+      let speed = 0;
+      jobs.forEach((job) => {
+        if (status.has(job.status))
+          status.set(job.status, status.get(job.status) + 1);
+        else
+          status.set(job.status, 1);
+
+        if (job.status === 'running')
+          speed += job.stats.ticks * 1e3 / job.elapsed;
+
+        total += job.stats.ticks;
+        if (job.result !== null)
+          results.push(job.result);
+      });
+
+      const space = Math.pow(2, huffin.parsePrefix(argv.prefix).bitLength);
+      const probability = 1 - Math.pow(1 - 1 / space, total);
+      const targetTicks = Math.log(1 - TARGET_PROBABILITY) /
+                          Math.log(1 - 1 / space);
+      const deltaTicks = Math.max(0, targetTicks - total);
+      const seconds = deltaTicks / speed;
+
+      const eta = {
+        days: Math.floor(seconds / (3600 * 24)),
+        hours: pad2(Math.floor((seconds % (3600 * 24)) / 3600)),
+        minutes: pad2(Math.floor((seconds % (3600)) / 60)),
+        seconds: pad2(Math.floor(seconds % 60))
+      };
+
+      console.log('Status:');
+      status.forEach((value, key) => console.log('  %s: %d', key, value));
+      console.log('Results: %j', results);
+      console.log('Ticks: %d', total);
+      console.log('Speed: %d', speed.toFixed(0));
+      console.log('Probability: %d%%', (probability * 100).toFixed(2));
+      console.log('Eta: %dd %dh %dm %ds', eta.days, eta.hours, eta.minutes,
+                  eta.seconds);
+    });
+  }
+
+  ocean.dropletsGetAll({
+    tag_name: 'huffin-' + argv.tag,
+    per_page: 1000
+  }, (err, res, body) => {
+    if (err)
+      throw err.message;
+
+    const names = body.droplets.map(({ name }) => name);
+    status(body.droplets);
+  });
+}
