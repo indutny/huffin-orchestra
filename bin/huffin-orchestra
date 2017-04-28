@@ -299,8 +299,8 @@ if (command === 'spawn') {
       console.log('Status:');
       status.forEach((value, key) => console.log('  %s: %d', key, value));
       console.log('Results: %j', results);
-      console.log('Ticks: %d', total);
-      console.log('Speed: %d', speed.toFixed(0));
+      console.log('Tried: %d keys', total);
+      console.log('Speed: %d keys/sec', speed.toFixed(0));
       console.log('Probability: %d%%', (probability * 100).toFixed(2));
       console.log('Eta: %dd %dh %dm %ds', eta.days, eta.hours, eta.minutes,
                   eta.seconds);
